@@ -34,11 +34,12 @@ from warnings import warn
 import calendar
 
 from six.moves.urllib.parse import urlencode
-from flask import request, session, redirect, url_for, g, current_app, abort
+from flask import request, session, redirect, url_for, g, current_app
 from oauth2client.client import flow_from_clientsecrets, OAuth2WebServerFlow,\
     AccessTokenRefreshError, OAuth2Credentials
 import httplib2
-from itsdangerous import JSONWebSignatureSerializer, BadSignature
+from itsdangerous import JSONWebSignatureSerializer, BadSignature, \
+    TimedJSONWebSignatureSerializer, SignatureExpired
 
 __all__ = ['OpenIDConnect', 'MemoryCredentials']
 
@@ -766,7 +767,7 @@ class OpenIDConnect(object):
         self._set_cookie_id_token(None)
 
     # Below here is for resource servers to validate tokens
-    def validate_token(self, token, scopes_required=None):
+    def validate_token(self, token, scopes_required=None, roles_required=None, keycloak=True):
         """
         This function can be used to validate tokens.
 
@@ -784,21 +785,24 @@ class OpenIDConnect(object):
 
         .. versionadded:: 1.1
         """
-        valid = self._validate_token(token, scopes_required)
+        valid = self._validate_token(token, scopes_required, roles_required, keycloak=True)
         if valid is True:
             return True
         else:
             return ErrStr(valid)
 
-    def _validate_token(self, token, scopes_required=None):
+    def _validate_token(self, token, scopes_required=None, roles_required=None, keycloak=True):
         """The actual implementation of validate_token."""
         if scopes_required is None:
             scopes_required = []
+        if roles_required is None:
+            roles_required = []
         scopes_required = set(scopes_required)
-
+        roles_required = set(roles_required)
         token_info = None
         valid_token = False
         has_required_scopes = False
+        has_required_roles = False
         if token:
             try:
                 token_info = self._get_token_info(token)
@@ -808,12 +812,12 @@ class OpenIDConnect(object):
                 logger.error(str(ex))
 
             valid_token = token_info.get('active', False)
-
+            clid = self.client_secrets['client_id']
             if 'aud' in token_info and \
                     current_app.config['OIDC_RESOURCE_CHECK_AUD']:
                 valid_audience = False
                 aud = token_info['aud']
-                clid = self.client_secrets['client_id']
+
                 if isinstance(aud, list):
                     valid_audience = clid in aud
                 else:
@@ -823,30 +827,44 @@ class OpenIDConnect(object):
                     logger.error('Refused token because of invalid '
                                  'audience')
                     valid_token = False
-
+            if keycloak and "realm_access" in token_info:
+                token_roles = token_info["realm_access"]["roles"]
+                if clid in token_info['resource_access']:
+                    token_roles_client = token_info['resource_access'][clid]["roles"]
+                else:
+                    token_roles_client = []
+                has_required_roles = roles_required.issubset(set(token_roles).union(set(token_roles_client)))
+            else:
+                has_required_roles = True
+                token_roles = []
             if valid_token:
                 token_scopes = token_info.get('scope', '').split(' ')
             else:
                 token_scopes = []
             has_required_scopes = scopes_required.issubset(
                 set(token_scopes))
-
             if not has_required_scopes:
                 logger.debug('Token missed required scopes')
+            if not has_required_roles:
+                logger.debug('Token missed required roles')
 
-        if (valid_token and has_required_scopes):
+
+        if (valid_token and has_required_scopes and has_required_roles):
             g.oidc_token_info = token_info
             return True
 
         if not valid_token:
-            return 'Token required but invalid'
+            return 'Token given but invalid'
         elif not has_required_scopes:
             return 'Token does not have required scopes'
+        elif not has_required_roles:
+            return 'Token does not have required roles'
         else:
             return 'Something went wrong checking your token'
 
+
     def accept_token(self, require_token=False, scopes_required=None,
-                           render_errors=True):
+                           render_errors=True, roles_required=None):
         """
         Use this to decorate view functions that should accept OAuth2 tokens,
         this will most likely apply to API functions.
@@ -862,6 +880,9 @@ class OpenIDConnect(object):
             was no token provided.
         :type require_token: bool
         :param scopes_required: List of scopes that are required to be
+            granted by the token before being allowed to call the protected
+            function.
+        :param roles_required: List of roles that are required to be
             granted by the token before being allowed to call the protected
             function.
         :type scopes_required: list
@@ -884,7 +905,7 @@ class OpenIDConnect(object):
                 elif 'access_token' in request.args:
                     token = request.args['access_token']
 
-                validity = self.validate_token(token, scopes_required)
+                validity = self.validate_token(token, scopes_required, roles_required)
                 if (validity is True) or (not require_token):
                     return view_func(*args, **kwargs)
                 else:
@@ -911,7 +932,7 @@ class OpenIDConnect(object):
         if (auth_method == 'client_secret_basic'):
             basic_auth_string = '%s:%s' % (self.client_secrets['client_id'], self.client_secrets['client_secret'])
             basic_auth_bytes = bytearray(basic_auth_string, 'utf-8')
-            headers['Authorization'] = 'Basic %s' % b64encode(basic_auth_bytes).decode('utf-8')
+            headers['Authorization'] = 'Basic {}'.format(b64encode(basic_auth_bytes).decode('utf-8'))
         elif (auth_method == 'bearer'):
             headers['Authorization'] = 'Bearer %s' % token
         elif (auth_method == 'client_secret_post'):
@@ -919,7 +940,7 @@ class OpenIDConnect(object):
             if self.client_secrets['client_secret'] is not None:
                 request['client_secret'] = self.client_secrets['client_secret']
 
-        resp, content = httplib2.Http().request(
+        resp, content = httplib2.Http(disable_ssl_certificate_validation=False).request(
             self.client_secrets['token_introspection_uri'], 'POST',
             urlencode(request), headers=headers)
         # TODO: Cache this reply
